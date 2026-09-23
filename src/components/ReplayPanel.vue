@@ -4,10 +4,11 @@
     <div v-if="replay.mode === 'review'" class="replay-lockbar">
       <span class="lb-dot"></span>
       <strong>复盘回放中 · 演练态势只读</strong>
+      <em class="lb-branch">🌿 {{ replay.currentBranch?.name || '演练分支' }}</em>
       <em>{{ replay.currentFrame?.at }} · 节点 {{ replay.cursor + 1 }}/{{ replay.frameCount }}</em>
       <button class="lb-btn" @click="replay.openPanel()">📼 查看时间轴</button>
-      <button class="lb-btn fork" @click="replay.resumeHere()">🌿 从此节点恢复演练</button>
-      <button class="lb-btn live" @click="replay.exitToLive()">⏭ 回到当前态势</button>
+      <button class="lb-btn fork" @click="onFork">🌿 从此节点分叉新分支</button>
+      <button class="lb-btn live" @click="replay.exitToLive()">⏭ 回到本分支末端</button>
     </div>
 
     <transition name="rp-slide">
@@ -71,12 +72,47 @@
           </button>
         </div>
 
-        <div class="rp-body">
+        <!-- 多分支管理条 -->
+        <div class="rp-branches">
+          <div class="br-head">
+            <span class="br-title">🌿 演练分支（{{ replay.branchList.length }}）</span>
+            <div class="br-tabs">
+              <button :class="{ on: tab === 'timeline' }" @click="tab = 'timeline'">🕒 时间轴</button>
+              <button
+                :class="{ on: tab === 'compare' }"
+                :disabled="!compare"
+                @click="tab = 'compare'"
+              >⚖ 分支对照<span v-if="compareSelCount" class="br-tab-n">{{ compareSelCount }}</span></button>
+            </div>
+          </div>
+          <div class="br-tree">
+            <template v-for="node in replay.branchTree" :key="node.id">
+              <BranchRow
+                :node="node"
+                :compare-pair="replay.comparePair"
+                :editing-id="editingId"
+                @continue="onContinue"
+                @view="onView"
+                @toggle-compare="replay.toggleCompare($event)"
+                @start-rename="editingId = $event"
+                @submit-rename="onRename"
+              />
+            </template>
+          </div>
+          <div v-if="replay.comparePair[0] || replay.comparePair[1]" class="br-compare-hint">
+            已选 {{ compareSelCount }}/2 条分支用于对照
+            <button v-if="compare" class="br-go-compare" @click="tab = 'compare'">查看对照 →</button>
+            <button class="br-clear" @click="replay.clearCompare()">清空</button>
+          </div>
+        </div>
+
+        <!-- 时间轴主体 -->
+        <div class="rp-body" v-if="tab === 'timeline'">
           <!-- 左：时间轴节点列表 -->
           <div class="rp-timeline">
             <div
               v-for="f in replay.visibleFrames"
-              :key="f.seq"
+              :key="(f.branchId || 'root') + '-' + f.index"
               class="rp-node"
               :class="{ active: f.index === replay.cursor, baseline: f.seq === 0, fork: f.fork }"
               @click="onSelect(f.index)"
@@ -211,12 +247,50 @@
 
             <!-- 节点操作 -->
             <div class="detail-actions">
-              <button class="act-fork" @click="replay.resumeHere()">
-                🌿 从此节点恢复演练
-                <small>截断之后 {{ replay.frameCount - replay.cursor - 1 }} 个节点，沿新分支继续</small>
+              <button class="act-fork" @click="onFork">
+                🌿 从此节点分叉新分支
+                <small>保留当前演练分支完整历史，从本节点另起一支独立推演（库存/床位/派发/抢修各自维护）</small>
               </button>
-              <button class="act-live" @click="replay.exitToLive()">⏭ 回到当前态势</button>
+              <button class="act-live" @click="replay.exitToLive()">⏭ 回到本分支末端</button>
             </div>
+          </div>
+        </div>
+
+        <!-- 分支对照主体 -->
+        <div class="rp-body" v-else-if="tab === 'compare' && compare">
+          <div class="compare-wrap">
+            <div class="compare-head">
+              <div class="compare-side" :style="{ borderColor: compare.a.color }">
+                <span class="cs-dot" :style="{ background: compare.a.color }"></span>
+                <strong>{{ compare.a.name }}</strong>
+                <em>{{ compare.a.frameCount }} 节点 · {{ compare.a.tipAt || '基线' }}</em>
+              </div>
+              <div class="compare-vs">VS</div>
+              <div class="compare-side right" :style="{ borderColor: compare.b.color }">
+                <span class="cs-dot" :style="{ background: compare.b.color }"></span>
+                <strong>{{ compare.b.name }}</strong>
+                <em>{{ compare.b.frameCount }} 节点 · {{ compare.b.tipAt || '基线' }}</em>
+              </div>
+            </div>
+
+            <table class="compare-table">
+              <thead>
+                <tr><th>处置结果指标</th><th>{{ compare.a.name }}</th><th>差异(B−A)</th><th>{{ compare.b.name }}</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="r in compare.rows" :key="r.key" :class="{ diff: !r.same }">
+                  <td class="cm-label">{{ r.label }}</td>
+                  <td class="cm-a">{{ r.a }}</td>
+                  <td class="cm-d" :class="r.diff > 0 ? 'up' : r.diff < 0 ? 'down' : ''">
+                    {{ r.same ? '—' : (r.diff > 0 ? '+' : '') + r.diff }}
+                  </td>
+                  <td class="cm-b">{{ r.b }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <p class="compare-note">
+              指标取各分支末端快照独立重算：库存合计、床位在住、派发四本账（累计签收/待补短缺）、转移人数、生效阻断与抢修工单均互不影响。
+            </p>
           </div>
         </div>
       </section>
@@ -225,7 +299,7 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, h, ref } from 'vue'
 import { useReplayStore } from '@/store/replay'
 
 const replay = useReplayStore()
@@ -233,6 +307,12 @@ const replay = useReplayStore()
 const diff = computed(() => replay.currentDiff)
 const logs = computed(() => replay.currentLogs)
 const baseline = computed(() => replay.baselineItems)
+
+const tab = ref('timeline')
+const editingId = ref(null)
+
+const compare = computed(() => replay.compareResult)
+const compareSelCount = computed(() => replay.comparePair.filter(Boolean).length)
 
 function onScrub(e) {
   replay.pause()
@@ -244,6 +324,107 @@ function onSelect(i) {
 }
 function logSourceLabel(s) {
   return { event: '事件时间线', block: '阻断处置', repair: '抢修工单' }[s] || s
+}
+
+// 分叉：保留原线、另起一支。分叉后关闭抽屉进入可操作态势。
+function onFork() {
+  const r = replay.resumeHere()
+  if (r?.ok) tab.value = 'timeline'
+}
+// 切到该分支末端继续 live 推演
+function onContinue(id) {
+  replay.switchBranch(id)
+}
+// 以只读复盘方式查看该分支末端（不改变当前活分支）
+function onView(id) {
+  replay.switchBranch(id, { asReview: true })
+}
+function onRename(id, name) {
+  replay.renameBranch(id, name)
+  editingId.value = null
+}
+
+/* 分支树的一行（含子分支递归）。用渲染函数以模板内联，避免再开单文件组件。 */
+const BranchRow = {
+  name: 'BranchRow',
+  props: {
+    node: { type: Object, required: true },
+    comparePair: { type: Array, default: () => [null, null] },
+    editingId: { type: String, default: null }
+  },
+  emits: ['continue', 'view', 'toggle-compare', 'start-rename', 'submit-rename'],
+  setup(props, { emit }) {
+    const draft = ref(props.node.name)
+    const sel = (id) => props.comparePair.includes(id)
+    const submit = () => {
+      const v = draft.value.trim()
+      if (v) emit('submit-rename', props.node.id, v)
+      draft.value = props.node.name
+    }
+    return ( ) => h('div', { class: 'br-row-wrap' }, [
+      h('div', {
+        class: ['br-row', { current: props.node.current }],
+        style: { marginLeft: props.node.depth * 16 + 'px' }
+      }, [
+        h('span', { class: 'br-rail', style: { background: props.node.color } }),
+        h('div', { class: 'br-main' }, [
+          props.editingId === props.node.id
+            ? h('input', {
+                class: 'br-name-input',
+                value: draft.value,
+                autofocus: true,
+                onClick: (e) => e.stopPropagation(),
+                onInput: (e) => { draft.value = e.target.value },
+                onKeydown: (e) => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') emit('start-rename', null) },
+                onBlur: submit
+              })
+            : h('div', { class: 'br-line' }, [
+                h('span', { class: 'br-name' },
+                  (props.node.root ? '🌲 ' : '🌿 ') + props.node.name),
+                props.node.current ? h('span', { class: 'br-now' }, '当前') : null,
+                h('span', { class: 'br-meta' },
+                  `${props.node.frameCount} 节点 · 自有 ${props.node.ownFrameCount} · ${props.node.tipAt || '基线'}`)
+              ]),
+          h('div', { class: 'br-ops' }, [
+            h('button', {
+              class: ['op', 'go', { on: props.node.current }],
+              title: '切换到该分支末端继续推演',
+              disabled: props.node.current,
+              onClick: (e) => { e.stopPropagation(); emit('continue', props.node.id) }
+            }, '▶ 续演'),
+            h('button', {
+              class: 'op view',
+              title: '只读查看该分支末端',
+              onClick: (e) => { e.stopPropagation(); emit('view', props.node.id) }
+            }, '👁 查看'),
+            h('button', {
+              class: ['op', 'cmp', { on: sel(props.node.id) }],
+              title: '加入分支对照（最多 2 条）',
+              onClick: (e) => { e.stopPropagation(); emit('toggle-compare', props.node.id) }
+            }, sel(props.node.id) ? '✓ 对照中' : '⚖ 对照'),
+            h('button', {
+              class: 'op ren',
+              title: '重命名分支',
+              onClick: (e) => { e.stopPropagation(); draft.value = props.node.name; emit('start-rename', props.node.id) }
+            }, '✎')
+          ])
+        ])
+      ]),
+      ...(props.node.children || []).map((ch) =>
+        h(BranchRow, {
+          key: ch.id,
+          node: ch,
+          comparePair: props.comparePair,
+          editingId: props.editingId,
+          onContinue: (id) => emit('continue', id),
+          onView: (id) => emit('view', id),
+          onToggleCompare: (id) => emit('toggle-compare', id),
+          onStartRename: (id) => emit('start-rename', id),
+          onSubmitRename: (id, name) => emit('submit-rename', id, name)
+        })
+      )
+    ])
+  }
 }
 </script>
 
@@ -484,4 +665,100 @@ function logSourceLabel(s) {
   .detail-grid { grid-template-columns: 1fr; }
   .detail-counters { grid-template-columns: repeat(3, 1fr); }
 }
+
+/* ===== 多分支管理条 ===== */
+.replay-lockbar .lb-branch {
+  font-style: normal; color: #b9f6ca; font-size: 11px;
+  background: rgba(46,125,50,0.3); border: 1px solid rgba(150,230,160,0.4);
+  padding: 2px 8px; border-radius: 10px;
+}
+.rp-branches {
+  border-bottom: 1px solid rgba(120,160,220,0.12);
+  padding: 8px 18px 9px;
+  max-height: 168px; display: flex; flex-direction: column;
+}
+.br-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.br-title { font-size: 11px; color: #cdd9ee; font-weight: 700; }
+.br-tabs { display: flex; gap: 4px; }
+.br-tabs button {
+  background: #101d36; border: 1px solid rgba(120,160,220,0.18);
+  color: #9db1d4; font-size: 11px; border-radius: 6px; padding: 3px 10px; cursor: pointer;
+}
+.br-tabs button.on { background: rgba(77,141,255,0.25); border-color: #4d8dff; color: #fff; }
+.br-tabs button:disabled { opacity: 0.4; cursor: not-allowed; }
+.br-tab-n {
+  display: inline-block; margin-left: 4px; min-width: 14px; padding: 0 4px;
+  background: #e69100; color: #fff; border-radius: 8px; font-size: 9px;
+}
+.br-tree { overflow-y: auto; flex: 1; }
+.br-row {
+  display: flex; align-items: stretch; gap: 0;
+  border-radius: 8px; padding: 2px 0;
+}
+.br-row.current { background: rgba(77,141,255,0.12); }
+.br-rail { width: 3px; border-radius: 2px; flex-shrink: 0; margin-right: 8px; }
+.br-main { flex: 1; min-width: 0; padding: 3px 4px; }
+.br-line { display: flex; align-items: center; gap: 8px; }
+.br-name { font-size: 12px; color: #e4ecfa; font-weight: 600; white-space: nowrap; }
+.br-now {
+  font-size: 9px; color: #b9f6ca; background: rgba(46,125,50,0.4);
+  border: 1px solid rgba(150,230,160,0.5); border-radius: 8px; padding: 0 6px;
+}
+.br-meta { font-size: 10px; color: #6f84ab; margin-left: auto; font-variant-numeric: tabular-nums; }
+.br-ops { display: flex; gap: 4px; margin-top: 3px; }
+.br-ops .op {
+  background: #101d36; border: 1px solid rgba(120,160,220,0.2);
+  color: #9db1d4; font-size: 10px; border-radius: 5px; padding: 2px 7px; cursor: pointer;
+}
+.br-ops .op:hover:not(:disabled) { border-color: #4d8dff; color: #fff; }
+.br-ops .op.on { background: rgba(230,145,0,0.3); border-color: #e69100; color: #ffe0b2; }
+.br-ops .op.go.on { background: rgba(46,125,50,0.35); border-color: #66bb6a; color: #b9f6ca; }
+.br-ops .op:disabled { opacity: 0.5; cursor: default; }
+.br-name-input {
+  background: #0b1428; border: 1px solid #4d8dff; color: #fff;
+  font-size: 12px; border-radius: 5px; padding: 2px 6px; width: 220px; outline: none;
+}
+.br-compare-hint {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 6px; font-size: 10px; color: #ffd180;
+}
+.br-go-compare {
+  margin-left: auto; background: rgba(230,145,0,0.25); border: 1px solid #e69100;
+  color: #ffe0b2; border-radius: 5px; font-size: 10px; padding: 2px 9px; cursor: pointer;
+}
+.br-clear {
+  background: transparent; border: 1px solid rgba(120,160,220,0.3);
+  color: #9db1d4; border-radius: 5px; font-size: 10px; padding: 2px 9px; cursor: pointer;
+}
+
+/* ===== 分支对照面板 ===== */
+.compare-wrap { padding: 16px 22px; width: 100%; overflow-y: auto; }
+.compare-head { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
+.compare-side {
+  flex: 1; display: flex; flex-direction: column; gap: 3px;
+  background: #0e1a32; border-left: 4px solid; border-radius: 10px; padding: 11px 14px;
+}
+.compare-side.right { text-align: right; }
+.compare-side strong { font-size: 14px; color: #fff; }
+.compare-side em { font-style: normal; font-size: 11px; color: #7d92b6; font-variant-numeric: tabular-nums; }
+.cs-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+.compare-vs {
+  font-size: 12px; font-weight: 800; color: #ffb74d;
+  background: rgba(230,145,0,0.15); border: 1px solid rgba(230,145,0,0.4);
+  border-radius: 50%; width: 38px; height: 38px; display: grid; place-items: center; flex-shrink: 0;
+}
+.compare-table { width: 100%; border-collapse: collapse; }
+.compare-table th, .compare-table td {
+  padding: 9px 12px; font-size: 12px; text-align: center;
+  border-bottom: 1px solid rgba(120,160,220,0.1);
+}
+.compare-table th { color: #9db1d4; font-size: 11px; background: #0e1a32; position: sticky; top: 0; }
+.compare-table td.cm-label { text-align: left; color: #cdd9ee; font-weight: 600; }
+.compare-table tr.diff { background: rgba(77,141,255,0.05); }
+.cm-a { color: #bcd0ee; font-variant-numeric: tabular-nums; }
+.cm-b { color: #bcd0ee; font-variant-numeric: tabular-nums; }
+.cm-d { font-variant-numeric: tabular-nums; color: #7d92b6; }
+.cm-d.up { color: #7ef0c9; font-weight: 700; }
+.cm-d.down { color: #ff8a65; font-weight: 700; }
+.compare-note { margin-top: 14px; font-size: 11px; color: #5f739a; line-height: 1.6; }
 </style>

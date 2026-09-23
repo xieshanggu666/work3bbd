@@ -8,13 +8,18 @@ import {
 } from '@/mock/data'
 
 /* =========================================================================
- * 历史复盘模块（事件溯源）
+ * 历史复盘模块（事件溯源 · 多分支）
  *
  * 录制：包装四个业务 store 的 action，每个成功改变状态的「最外层动作」沉淀一帧——
  *       全量状态快照（事件/派发/转移/阻断/抢修/库存）+ 动作元数据 + 当帧新增处置日志。
  * 回放：seek 到任意帧即用快照整体替换当前态势（地图/面板全部响应式联动），
  *       回放期间业务动作一律拦截，演练处于只读锁定状态。
- * 恢复：从任意节点「恢复演练」= 在该帧分叉，截断之后的历史，后续动作沿新分支继续记录。
+ * 多分支：时间轴组织为一棵「分支树」。主干（root）自场景基线线性录制；
+ *       从任意历史帧「分叉恢复」时，原演练分支完整保留（不再截断），
+ *       以该帧快照为起点克隆出一条新的子分支并切换过去，沿当时态势继续独立推演——
+ *       各分支独立维护自己的库存、床位、派发与抢修状态（各自的全量快照序列）。
+ *       可随时在分支间切换继续推演，并把任意两条分支的末端处置结果并列对照。
+ *       state.frames / seq / cursor 始终是「当前分支」的视图，旧单线调用方无感。
  * ========================================================================= */
 
 const STATUS_LABEL = (list) => (v) => list.find((s) => s.value === v)?.label || v
@@ -509,6 +514,52 @@ function baselineOverview(snap) {
   return items
 }
 
+/* ---------- 分支末端处置结果汇总（跨分支对照） ----------
+ * 纯函数：仅依赖快照，库存/床位/派发账目均在快照内重新核算，保证各分支独立。 */
+function branchSummary(snap) {
+  const events = snap.cmd.events
+  const dispatches = snap.cmd.dispatches
+  const batches = snap.tr.batches
+
+  const activeEvents = events.filter((e) => e.status !== 'closed').length
+
+  let signedTotal = 0
+  let shortPendingTotal = 0
+  let stockTotal = 0
+  dispatches.forEach((d) => {
+    signedTotal += d.signedQty || 0
+    // 短缺待补 = 认定短缺 − 已补派（撤回/退回的补派单不计入已补，近似按主单 shortReplenished）
+    shortPendingTotal += Math.max(0, (d.shortQty || 0) - (d.shortReplenished || 0))
+  })
+  snap.cmd.bases.forEach((b) => {
+    Object.values(b.stock || {}).forEach((n) => { stockTotal += n || 0 })
+  })
+
+  let inHouse = 0
+  let transferred = 0
+  batches.forEach((bt) => {
+    bt.members.forEach((m) => {
+      if (m.checkoutAt) transferred += 1
+      else if (m.checkinAt) inHouse += 1
+    })
+  })
+
+  return {
+    events: events.length,
+    activeEvents,
+    dispatches: dispatches.length,
+    signedTotal,
+    shortPendingTotal,
+    batches: batches.length,
+    transferred,
+    inHouse,
+    blocks: snap.rb.blocks.filter((x) => x.status === 'active').length,
+    orders: snap.ro.orders.length,
+    settleDay: snap.tr.settleDay,
+    stockTotal
+  }
+}
+
 /* ---------- action 包装器（录制 + 回放锁定） ---------- */
 
 function makeWrapper(module, name, orig) {
@@ -557,14 +608,20 @@ export const useReplayStore = defineStore('replay', {
     active: false,          // 录制器已开始（begin 后为 true）
     mode: 'live',           // live 演练录制中 / review 复盘回放只读
     panelOpen: false,
-    frames: [],             // 帧序列（每帧含全量快照）
-    seq: 0,
+    frames: [],             // 【当前分支】帧序列（每帧含全量快照），= branches[currentBranchId].frames 的视图
+    seq: 0,                 // 【当前分支】末帧序号
     cursor: 0,              // 回放当前帧下标
     playing: false,
     speed: 1,
     filterCat: 'all',
     capReached: false,
-    testClock: null         // 测试用：固定帧时间戳（ms）
+    testClock: null,        // 测试用：固定帧时间戳（ms）
+    /* ---------- 多分支注册表 ---------- */
+    branches: {},           // id -> { id, name, root, parentId, forkAt, color, createdAt, frames }
+    branchOrder: [],        // 分支 id 的稳定顺序（主干在前，按创建先后）
+    currentBranchId: null,  // 当前所处分支
+    branchSeq: 0,           // 分支自增序号（命名/配色/取 id 用）
+    comparePair: [null, null] // 对照面板选中的两个分支 id
   }),
 
   getters: {
@@ -594,6 +651,98 @@ export const useReplayStore = defineStore('replay', {
     baselineItems() {
       const f = this.currentFrame
       return f?.seq === 0 ? baselineOverview(f.snapshot) : []
+    },
+
+    /* ---------- 多分支视图 ---------- */
+    currentBranch(state) {
+      return state.branches[state.currentBranchId] || null
+    },
+    // 分支列表（稳定顺序），附带派生信息：帧数、末帧快照、分叉来源、深度、是否当前
+    branchList() {
+      const depthOf = (b) => {
+        let d = 0, cur = b
+        while (cur && cur.parentId) { d++; cur = this.branches[cur.parentId] }
+        return d
+      }
+      return this.branchOrder
+        .map((id) => this.branches[id])
+        .filter(Boolean)
+        .map((b) => {
+          const tip = b.frames[b.frames.length - 1]
+          return {
+            id: b.id,
+            name: b.name,
+            root: b.root,
+            parentId: b.parentId,
+            forkAt: b.forkAt,
+            color: b.color,
+            depth: depthOf(b),
+            frameCount: b.frames.length,
+            ownFrameCount: b.frames.length - (b.forkAt + 1),
+            createdAt: b.createdAt,
+            tipAt: tip?.at || '',
+            tip: tip || null,
+            current: b.id === this.currentBranchId,
+            summary: tip ? branchSummary(tip.snapshot) : null
+          }
+        })
+    },
+    // 主干分支
+    rootBranch() {
+      return this.branchList.find((b) => b.root) || null
+    },
+    // 从主干到当前分支的血缘链（id 序列）
+    lineage() {
+      const chain = []
+      let cur = this.currentBranch
+      while (cur) {
+        chain.unshift(cur.id)
+        cur = cur.parentId ? this.branches[cur.parentId] : null
+      }
+      return chain
+    },
+    // 分支树（主干 + 子节点递归），供 UI 画树形结构
+    branchTree() {
+      const map = {}
+      this.branchList.forEach((b) => { map[b.id] = { ...b, children: [] } })
+      const roots = []
+      this.branchList.forEach((b) => {
+        if (b.parentId && map[b.parentId]) map[b.parentId].children.push(map[b.id])
+        else roots.push(map[b.id])
+      })
+      return roots
+    },
+    // 当前选中的两条对照分支（空槽位为 null）
+    compareBranches() {
+      const [a, b] = this.comparePair
+      return [a ? this.branchList.find((x) => x.id === a) || null : null,
+              b ? this.branchList.find((x) => x.id === b) || null : null]
+    },
+    // 两分支末端对照：同名指标并列 + 差异标记
+    compareResult() {
+      const [a, b] = this.compareBranches
+      if (!a || !b) return null
+      const sa = a.summary, sb = b.summary
+      const metrics = [
+        ['events', '事件总数'], ['activeEvents', '在报事件'],
+        ['dispatches', '派发记录'], ['signedTotal', '累计签收'], ['shortPendingTotal', '待补短缺'],
+        ['batches', '转移批次'], ['transferred', '已转出群众'], ['inHouse', '当前在住安置'],
+        ['blocks', '生效阻断'], ['orders', '抢修工单'], ['settleDay', '补给结算日'],
+        ['stockTotal', '基地物资库存合计']
+      ]
+      return {
+        a, b,
+        rows: metrics.map(([key, label]) => {
+          const va = sa[key], vb = sb[key]
+          return {
+            key, label,
+            a: va, b: vb,
+            // 越大越好的指标（签收/已转出/在住/库存）与越小越好的指标分别给出有利方
+            diff: typeof va === 'number' && typeof vb === 'number' ? vb - va : 0,
+            same: va === vb
+          }
+        })
+      }
     }
   },
 
@@ -601,60 +750,107 @@ export const useReplayStore = defineStore('replay', {
     // 演示/测试：固定帧时间戳
     setTestClock(ms) { this.testClock = ms == null ? null : Number(ms) },
 
-    // 开始/重置录制：以当前态势作为基线帧（场景载入完成后调用）
+    /* ---------- 分支内部工具 ---------- */
+
+    _branch(id) { return this.branches[id] },
+
+    // 把指定分支的帧序列挂载到 state.frames/seq 视图（不触碰业务态势）
+    _mountView(id) {
+      const b = this._branch(id)
+      this.currentBranchId = id
+      this.frames = b.frames
+      this.seq = b.frames.length ? b.frames[b.frames.length - 1].seq : 0
+      this.cursor = b.frames.length - 1
+    },
+
+    // 新分支命名 / 配色
+    _nextBranchName() {
+      this.branchSeq += 1
+      return `演练分支 ${this.branchSeq}`
+    },
+    _branchColor(index) {
+      const palette = ['#4d8dff', '#26a69a', '#ab47bc', '#ff9800', '#ef5350', '#66bb6a', '#ec407a', '#29b6f6']
+      return palette[index % palette.length]
+    },
+
+    // 开始/重置录制：清空分支树，以当前态势作为主干基线帧（场景载入完成后调用）
     begin() {
       this._stopTimer()
       this.active = true
       this.mode = 'live'
-      this.frames = []
-      this.seq = 0
-      this.cursor = 0
+      this.branches = {}
+      this.branchOrder = []
+      this.branchSeq = 0
+      this.comparePair = [null, null]
       this.playing = false
       this.capReached = false
-      this._pushBaseline()
+      this._createRootBranch()
     },
 
-    _pushBaseline() {
+    _createRootBranch() {
       const snap = takeSnapshot()
-      this.frames.push({
+      const frame = {
         seq: 0,
-        t: this._nowMs(),
-        at: timeLabel(this._nowMs()),
+        t: this._nowMs(0),
+        at: timeLabel(this._nowMs(0)),
         module: 'system', action: 'begin', category: 'system',
         title: '演练开始 · 场景载入',
         args: null,
         logs: [],
         snapshot: snap,
-        fork: false
-      })
+        fork: false,
+        branchId: null
+      }
+      const id = 'b-root'
+      this.branches[id] = {
+        id,
+        name: '主干推演',
+        root: true,
+        parentId: null,
+        forkAt: -1,            // 主干从基线帧起，无外部父分叉点
+        color: '#4d8dff',
+        createdAt: Date.now(),
+        frames: [frame]
+      }
+      frame.branchId = id
+      this.branchOrder = [id]
+      this._mountView(id)
     },
 
-    _nowMs() {
-      if (this.testClock != null) return this.testClock + this.seq * 1000
+    // 分支内帧时间戳：testClock 固定基线时刻，按全局帧序号逐帧 +1s
+    _nowMs(frameSeq = this.seq) {
+      if (this.testClock != null) return this.testClock + frameSeq * 1000
       return Date.now()
     },
 
-    // 业务动作执行后沉淀一帧（状态无变化的空动作/校验拦截不记录）
+    // 业务动作执行后沉淀一帧到【当前分支】（状态无变化的空动作/校验拦截不记录）
     recordFrame(module, action, args) {
       if (this.mode !== 'live' || !this.active) return
-      if (this.frames.length >= FRAME_CAP) { this.capReached = true; return }
+      const b = this._branch(this.currentBranchId)
+      if (!b) return
+      if (b.frames.length >= FRAME_CAP) { this.capReached = true; return }
       const snap = takeSnapshot()
-      const prev = this.frames[this.frames.length - 1]
+      const prev = b.frames[b.frames.length - 1]
       // 与上一帧态势完全相同（动作被业务校验拦截、未产生任何变化）→ 不入时间轴
       if (prev && JSON.stringify(snap) === JSON.stringify(prev.snapshot)) return
-      this.seq += 1
+      const nextSeq = (prev?.seq ?? -1) + 1
       const { category, title } = describeFrame(module, action, args, snap)
-      const t = this._nowMs()
-      this.frames.push({
-        seq: this.seq,
+      const t = this._nowMs(nextSeq)
+      b.frames.push({
+        seq: nextSeq,
         t,
         at: timeLabel(t),
         module, action, category, title,
         args: clone(args),
         logs: collectLogs(snap, prev?.snapshot || null),
         snapshot: snap,
-        fork: false
+        fork: false,
+        branchId: b.id
       })
+      // 同步当前分支视图
+      this.frames = b.frames
+      this.seq = nextSeq
+      this.cursor = b.frames.length - 1
     },
 
     /* ---------- 面板 ---------- */
@@ -703,21 +899,93 @@ export const useReplayStore = defineStore('replay', {
       if (playTimer) { clearInterval(playTimer); playTimer = null }
     },
 
-    // 从当前节点恢复演练：截断后续历史形成分叉分支，回到可操作的 live 态势
-    resumeHere() {
+    // 从当前节点「分叉恢复」演练：
+    // 原演练分支完整保留（不截断），以游标帧为起点深克隆出一条新的子分支并切换过去，
+    // 回到可操作的 live 态势；后续动作只沉淀到新分支，库存/床位/派发/抢修随该分支独立演进。
+    // 返回 { ok, branchId }；对同一帧重复分叉允许（产生平行方案分支）。
+    resumeHere(name = '') {
+      const src = this._branch(this.currentBranchId)
       const node = this.frames[this.cursor]
-      if (!node) return
+      if (!src || !node) return { ok: false }
       this.pause()
-      const kept = this.frames.slice(0, this.cursor + 1)
-      kept[kept.length - 1] = { ...node, fork: true }
-      this.frames = kept
-      this._restore(node.snapshot)
+
+      // 深克隆前缀帧序列：新分支必须与父分支后续帧彻底脱钩，避免快照互相穿透
+      const kept = clone(src.frames.slice(0, this.cursor + 1))
+      const forkFrame = { ...kept[kept.length - 1], fork: true }
+      kept[kept.length - 1] = forkFrame
+
+      this.branchSeq += 1
+      const id = `b-${Date.now().toString(36)}-${this.branchSeq}`
+      const branchName = (name || '').trim() || `分支：${node.title.slice(0, 12)}`
+      this.branches[id] = {
+        id,
+        name: branchName,
+        root: false,
+        parentId: src.id,
+        forkAt: this.cursor,        // 在父分支第 cursor 帧处分叉
+        color: this._branchColor(this.branchSeq),
+        createdAt: Date.now(),
+        frames: kept
+      }
+      forkFrame.branchId = id
+      this.branchOrder.push(id)
+
+      // 切换到新分支：视图定位在分叉点，态势还原为分叉帧
+      this._mountView(id)
+      this.cursor = kept.length - 1
+      this._restore(forkFrame.snapshot)
       this.mode = 'live'
       this.playing = false
       this.panelOpen = false
+      return { ok: true, branchId: id }
     },
 
-    // 退出回放：回到「当前」（最后一帧）态势继续演练，保留完整历史
+    /* ---------- 分支切换 / 管理 ---------- */
+
+    // 切换到另一分支继续推演：默认定位该分支末端、还原态势并回到 live。
+    // opts.asReview=true 则保持复盘只读并定位到该分支末端（仅查看，不切活）。
+    switchBranch(id, opts = {}) {
+      const target = this._branch(id)
+      if (!target || id === this.currentBranchId) return { ok: false }
+      this.pause()
+      this._mountView(id) // 视图切到目标分支末端
+      const tip = target.frames[target.frames.length - 1]
+      if (opts.asReview) {
+        this.mode = 'review'
+        this.cursor = target.frames.length - 1
+        this.panelOpen = true
+      } else {
+        this.mode = 'live'
+        this.panelOpen = false
+      }
+      if (tip) this._restore(tip.snapshot)
+      return { ok: true }
+    },
+
+    // 重命名分支（主干也可改名）
+    renameBranch(id, name) {
+      const b = this._branch(id)
+      if (b && name.trim()) b.name = name.trim()
+    },
+
+    // 对照面板：选中/取消选中某分支（最多两个槽位，再次点击取消）
+    toggleCompare(id) {
+      const [a, b] = this.comparePair
+      if (a === id) this.comparePair = [null, b]
+      else if (b === id) this.comparePair = [a, null]
+      else if (!a) this.comparePair = [id, b]
+      else if (!b) this.comparePair = [a, id]
+      else this.comparePair = [b, id] // 已满：最早的让位
+    },
+    clearCompare() { this.comparePair = [null, null] },
+
+    // 某分支的末端（tip）帧；用于只读查看另一分支而不切活
+    tipOf(id) {
+      const b = this._branch(id)
+      return b ? b.frames[b.frames.length - 1] : null
+    },
+
+    // 退出回放：回到「当前」（当前分支最后一帧）态势继续推演，保留完整历史
     exitToLive() {
       this.pause()
       const last = this.frames[this.frames.length - 1]

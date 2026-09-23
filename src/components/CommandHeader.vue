@@ -81,6 +81,15 @@
       <div class="clock">{{ now }}</div>
       <div class="head-actions">
         <button
+          v-if="replay.branchList.length > 1"
+          class="branch-chip"
+          :style="{ borderColor: replay.currentBranch?.color, color: replay.currentBranch?.color }"
+          title="当前所在演练分支 · 点击管理多分支"
+          @click="openReplay"
+        >
+          🌿 {{ replay.currentBranch?.name || '演练分支' }}
+        </button>
+        <button
           class="replay-btn"
           :class="{ reviewing: replay.mode === 'review' }"
           :disabled="!replay.active || !replay.frameCount"
@@ -184,7 +193,14 @@ onBeforeUnmount(() => clearInterval(timer))
   font-family: 'Consolas', monospace; color: #7ef0c9; font-size: 15px;
   text-shadow: 0 0 8px rgba(126,240,201,0.5);
 }
-.head-actions { display: flex; gap: 6px; }
+.head-actions { display: flex; gap: 6px; align-items: center; }
+.branch-chip {
+  background: rgba(13,27,54,0.85);
+  border: 1px solid #4d8dff; border-radius: 12px;
+  font-size: 11px; font-weight: 600; padding: 3px 11px; cursor: pointer;
+  max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.branch-chip:hover { filter: brightness(1.25); }
 .replay-btn {
   background: linear-gradient(135deg, #1d3f8f, #2962ff);
   border: 1px solid rgba(120,180,255,0.5);
