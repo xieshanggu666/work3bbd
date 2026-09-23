@@ -175,43 +175,142 @@ assert(rp.cursor === totalFrames - 1 && rp.atLastFrame, '跳到最新节点')
 assert(rb.blocks.find((b) => b.id === blk.id)?.status === 'active', '最新节点阻断仍生效')
 assert(ro.orders.find((o) => o.id === order.id)?.status === 'accepted', '最新节点工单抢修中')
 
-console.log('— 从中间节点分叉恢复演练：截断未来、后续沿新分支记录 —')
+console.log('— 从中间节点分叉恢复演练：原演练分支保留、新分支独立续写 —')
 const forkIdx = idxSign // 从「签收 80/短缺 20」帧分叉（补派/批次/阻断都是旧未来）
 assert(forkIdx >= 1, '签收帧序号有效')
 rp.seek(forkIdx)
-rp.resumeHere()
-assert(rp.mode === 'live', '分叉后回到 live 可操作模式')
-assert(rp.frameCount === forkIdx + 1, `时间轴截断到分叉点（${rp.frameCount} === ${forkIdx + 1}）`)
-const forkFrame = rp.frames[forkIdx]
-assert(forkFrame.fork === true, '分叉节点已标记 🌿')
-// 分叉点库存/资源占用严格以分叉帧快照为准（新分支任何动作发生之前；live 模式 currentFrame 指向最新帧，需显式取分叉帧）
+const forkId = rp.resumeHere()
+assert(typeof forkId === 'string' && forkId !== 'main', '分叉返回新分支 id')
+assert(rp.branchCount === 2, '分支树现有 2 条分支（主干保留）')
+assert(rp.mode === 'live' && rp.currentBranchId === forkId, '分叉后位于新分支、live 可操作模式')
+const mainBranch = rp.branchById('main')
+const forkBranch = rp.branchById(forkId)
+assert(mainBranch.frames.length === totalFrames, `原演练分支历史完整保留（${mainBranch.frames.length} === ${totalFrames}，不截断）`)
+assert(forkBranch.frames.length === forkIdx + 1, `新分支仅含共同祖先帧（${forkBranch.frames.length} === ${forkIdx + 1}）`)
+assert(forkBranch.parentId === 'main' && forkBranch.forkFrameIndex === forkIdx, '子分支记录父分支与分叉帧下标（溯源信息）')
+const forkFrame = forkBranch.frames[forkIdx]
+assert(forkFrame.fork === true && mainBranch.frames[forkIdx].fork === true, '父子两侧分叉节点均标记 🌿')
+// 分叉点库存/资源占用严格以分叉帧快照为准（新分支任何动作发生之前）
 assert(base2().stock.vehicle === forkFrame.snapshot.cmd.bases.find((b) => b.id === 'rb-2').stock.vehicle, '分叉点车辆库存与分叉帧快照一致（旧未来的建批占用已回滚）')
 const recAtFork = cmd.dispatches.find((d) => d.id === rec.id)
 assert(recAtFork.signedQty === 80 && dispatchParts(recAtFork).shortPending === 20, '分叉点态势保留（短缺缺口重新释放）')
-assert(!cmd.dispatches.find((d) => d.replenishOf === rec.id), '分叉点尚无补派单（旧未来已丢弃）')
-assert(rb.blocks.length === 0 && tr.batches.find((b) => b.id === cb.id) == null, '分叉点无阻断/批次（它们是旧未来）')
+assert(!cmd.dispatches.find((d) => d.replenishOf === rec.id), '分叉点尚无补派单（旧未来在新分支不存在）')
+assert(rb.blocks.length === 0 && tr.batches.find((b) => b.id === cb.id) == null, '分叉点无阻断/批次（它们是原分支的旧未来）')
 
 // 沿新分支演练：换一种处置——不补派食品，改派饮用水
+const waterAtFork = base2().stock.water
 const alt = cmd.dispatchResource({ baseId: 'rb-2', eventId: ev.id, type: 'water', qty: 50 })
 assert(!!alt, '新分支上执行替代派发成功')
-const fNew = rp.frames[rp.frameCount - 1]
-assert(rp.frameCount === forkIdx + 2 && fNew.title.includes('饮用水'), '新分支动作在截断后追加 1 帧: ' + fNew.title)
-assert(fNew.seq > rp.frames[forkIdx].seq, '新分支帧序号在分叉点之后递增')
+const fNew = forkBranch.frames[forkBranch.frames.length - 1]
+assert(forkBranch.frames.length === forkIdx + 2 && fNew.title.includes('饮用水'), '新分支动作在分叉点后追加 1 帧: ' + fNew.title)
+assert(fNew.seq > forkBranch.frames[forkIdx].seq, '新分支帧序号在分叉点之后递增')
+assert(base2().stock.water === waterAtFork - 50, '新分支独立扣减自己的库存账')
 
 // 新分支上再建批次（旧未来的批次 ID 不应冲突）
 const cb2 = tr.createBatch({ eventId: ev.id, name: '复盘新批次', headcount: 10, vehicleBaseId: 'rb-2', vehicleCount: 1, shelterId: 'sh-1' })
-assert(cb2.ok && cb2.batch.id !== cb.id, '新分支批次 ID 与旧未来不冲突')
-assert(rp.frames[rp.frameCount - 1].title.includes('复盘新批次'), '新分支建批帧标题正确')
+assert(cb2.ok && cb2.batch.id !== cb.id, '新分支批次 ID 与原分支旧未来不冲突')
+assert(forkBranch.frames[forkBranch.frames.length - 1].title.includes('复盘新批次'), '新分支建批帧标题正确')
 
-console.log('— 退出回放回到当前态势（保留完整历史）—')
+console.log('— 切回原演练分支：库存/床位/派发/抢修状态独立、可继续推演 —')
+rp.switchBranch('main')
+assert(rp.mode === 'live' && rp.currentBranchId === 'main', '切换回主干、进入 live')
+assert(rp.frameCount === totalFrames, `主干帧序列仍为 ${totalFrames}（分叉与新分支动作未污染）`)
+assert(!!cmd.dispatches.find((d) => d.replenishOf === rec.id), '主干上旧未来的补派单随切换还原')
+assert(tr.batches.find((b) => b.id === cb.id) && rb.blocks.find((x) => x.id === blk.id), '主干上原批次/阻断还原')
+assert(ro.orders.find((o) => o.id === order.id)?.progress === 60, '主干末端抢修工单进度 60% 还原（独立抢修状态）')
+assert(base2().stock.water === mainBranch.frames[totalFrames - 1].snapshot.cmd.bases.find((b) => b.id === 'rb-2').stock.water, '主干库存按主干末端快照还原（新分支的 50 水派发不影响主干）')
+assert(base2().stock.water !== waterAtFork - 50, '两分支库存相互隔离')
+assert(tr.bedMap['sh-2'].inHouse === 40, '主干床位占用还原：原批次 40 人在住')
+assert(!tr.batches.find((b) => b.id === cb2.batch.id), '主干上看不到新分支独有的批次')
+
+// 主干继续推演（与子分支并行）
+const mainExtra = cmd.dispatchResource({ baseId: 'rb-2', eventId: ev.id, type: 'food', qty: 10 })
+assert(!!mainExtra && mainBranch.frames.length === totalFrames + 1, '主干追加动作只进主干时间轴')
+assert(forkBranch.frames.length === forkIdx + 3, '子分支帧序列不受主干续写影响')
+
+console.log('— 再切回分叉分支：状态与录制目标随之切换 —')
+rp.switchBranch(forkId)
+assert(cmd.dispatches.find((d) => d.id === alt.id)?.qty === 50, '分叉分支末端：替代水派发在')
+assert(!!tr.batches.find((b) => b.id === cb2.batch.id), '分叉分支末端：新批次在')
+assert(!cmd.dispatches.find((d) => d.id === mainExtra.id), '分叉分支看不到主干续写帧的派发')
+const foodNow = base2().stock.food
+const fOnFork = forkBranch.frames.length
+cmd.dispatchResource({ baseId: 'rb-2', eventId: ev.id, type: 'food', qty: 5 })
+assert(forkBranch.frames.length === fOnFork + 1 && mainBranch.frames.length === totalFrames + 1, '在分叉分支上的动作只入分叉分支')
+assert(base2().stock.food === foodNow - 5, '分叉分支独立食品库存账')
+
+console.log('— 分叉分支上再次分叉（多层分支树、兄弟分支互不影响） —')
+rp.enterReview(forkIdx, forkId)
+const fork2Id = rp.resumeHere({ name: '补派方案' })
+assert(rp.branchCount === 3, '分支树现有 3 条分支')
+const fork2 = rp.branchById(fork2Id)
+assert(fork2.parentId === forkId && fork2.forkFrameIndex === forkIdx, '二级分叉的父分支为一级分叉分支')
+assert(forkBranch.frames.length === fOnFork + 1, '再次分叉不截断父分叉分支（兄弟分支并存）')
+assert(rp.currentBranchId === fork2Id && fork2.frames.length === forkIdx + 1, '新分支从共同分叉点出发')
+// 该方案走原设想：补派短缺食品
+cmd.replenishShortage(rec.id)
+assert(fork2.frames.length === forkIdx + 2, '二级分支动作独立成帧')
+assert(dispatchParts(cmd.dispatches.find((d) => d.id === rec.id)).shortPending === 0, '补派方案：短缺缺口已补')
+
+console.log('— 分支对照：处置结果差异按维度列出（库存/床位/派发/抢修） —')
+rp.openCompare(forkId, fork2Id)
+assert(!!rp.compareResult, '生成对照结果')
+const cmp1 = rp.compareResult
+assert(cmp1.a.branch.id === forkId && cmp1.b.branch.id === fork2Id, '对照两侧为两条分叉分支')
+assert(cmp1.rows.length > 0, '两方案末端态势存在差异')
+assert(cmp1.groups.some((g) => g.dim === '物资派发'), '对照含「物资派发」维度（水派发 vs 食品补派）')
+assert(cmp1.groups.some((g) => g.dim === '基地库存'), '对照含「基地库存」维度')
+assert(cmp1.groups.some((g) => g.dim === '转移批次'), '对照含「转移批次」维度（新分支批次仅一侧有）')
+assert(cmp1.rows.every((r) => r.a !== r.b), '对照仅列出有差异的条目')
+// 交换 / 防同分支
+rp.swapCompare()
+assert(rp.compareResult.a.branch.id === fork2Id && rp.compareResult.b.branch.id === forkId, '交换对照两侧')
+rp.setCompareSide('a', fork2Id) // 与 b 相同 → 忽略
+assert(rp.compare.a === fork2Id && rp.compare.b === forkId, '同一分支不能同时作为对照两侧')
+rp.closeCompare()
+assert(rp.compareResult === null, '关闭对照')
+
+console.log('— 回放中切换查看其它分支（只读，不改写任何分支历史） —')
+rp.enterReview(0, 'main')
+assert(rp.mode === 'review' && rp.currentBranchId === 'main' && rp.cursor === 0, '进入主干首帧回放')
+assert(cmd.dispatches.length === 0, '主干首帧：无派发')
+const mainLenBefore = mainBranch.frames.length
+cmd.dispatchResource({ baseId: 'rb-2', eventId: ev.id, type: 'food', qty: 9 })
+assert(cmd.dispatches.length === 0 && mainBranch.frames.length === mainLenBefore, '回放中业务动作仍被拦截')
+rp.switchBranch(fork2Id)
+assert(rp.mode === 'live' && !!cmd.dispatches.find((d) => d.replenishOf === rec.id), '从回放直接切到二级分支末端继续推演')
+
+console.log('— 退出回放回到当前分支末端（保留完整历史）—')
 rp.enterReview(0)
 rp.exitToLive()
-assert(rp.mode === 'live' && rp.cursor === rp.frameCount - 1, '回到 live 且定位最新帧')
-assert(cmd.dispatches.find((d) => d.id === alt.id)?.qty === 50, '当前态势=新分支最新状态（含替代派发）')
+assert(rp.mode === 'live' && rp.cursor === rp.frameCount - 1, '回到当前分支 live 且定位末端帧')
+assert(!!cmd.dispatches.find((d) => d.replenishOf === rec.id), '当前分支（二级分叉）末端态势正确')
+
+console.log('— 向后兼容：旧版单线 frames 历史可直接载入为单主干分支 —')
+const legacyFrames = mainBranch.frames
+const legacyCount = rp.branchCount
+rp.begin() // 重置后为空主干
+assert(rp.branchCount === 1 && rp.frameCount === 1, '重置后为单基线主干')
+const ok = rp.loadLegacyFrames(legacyFrames.map((f) => ({ ...f })))
+assert(ok === true, '旧单线结构载入成功')
+assert(rp.branchCount === 1 && rp.currentBranchId === 'main', '归一化为单主干分支')
+assert(rp.frameCount === legacyFrames.length, `旧帧全部保留（${rp.frameCount} === ${legacyFrames.length}）`)
+assert(rp.frames[0].branchId === 'main' && rp.frames[0].snapshot.cmd.events.length >= 1, '旧帧补齐 branchId、快照可读')
+rp.last()
+assert(rb.blocks.find((b) => b.id === blk.id)?.status === 'active', '旧单线历史 seek 到末端：阻断态势精确还原')
+assert(ro.orders.find((o) => o.id === order.id)?.progress === 60, '旧单线历史 seek 到末端：抢修进度还原')
+// 兼容旧 API 语义：在载入的旧单线上可直接回放/分叉（分叉自动升级为多分支树）
+rp.first()
+assert(rp.cursor === 0 && cmd.dispatches.length === 0, '旧历史基线帧 seek 正常')
+const compatFork = rp.resumeHere()
+assert(!!compatFork && rp.branchCount === 2, '旧单线历史分叉后自动形成分支树')
+assert(rp.branchById('main').frames.length === legacyFrames.length, '兼容模式下分叉同样保留原线')
+assert(legacyCount >= 2, '（前置）多分支场景曾真实建立')
+
 
 if (failed) {
   console.error(`\n❌ 历史复盘模块测试 ${failed} 项失败`)
   process.exit(1)
 } else {
-  console.log('\n✅ 历史复盘模块全部通过：基线录制/逐帧快照/四维度差异/回放只读锁定/任意节点 seek/分叉恢复演练/新分支续写')
+  console.log('\n✅ 历史复盘模块全部通过：基线录制/逐帧快照/四维度差异/回放只读锁定/任意节点 seek/多分支分叉保留原线/分支切换续写/库存床位派发抢修分支独立/多层分支树/分支处置结果对照/旧单线历史兼容')
 }
